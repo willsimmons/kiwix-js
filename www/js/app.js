@@ -518,7 +518,7 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
                         + " storages found with getDeviceStorages instead of 1");
                 }
             }
-            resetCssCache();
+            resetAssetsCache();
             selectedArchive = zimArchiveLoader.loadArchiveFromDeviceStorage(selectedStorage, archiveDirectory, function (archive) {
                 cookies.setItem("lastSelectedArchive", archiveDirectory, Infinity);
                 // The archive is set : go back to home page to start searching
@@ -531,10 +531,10 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
     /**
      * Resets the CSS Cache (used only in jQuery mode)
      */
-    function resetCssCache() {
-        // Reset the cssCache. Must be done when archive changes.
-        if (cssCache) {
-            cssCache = new Map();
+    function resetAssetsCache() {
+        // Reset the assetsCache. Must be done when archive changes.
+        if (assetsCache) {
+            assetsCache = new Map();
         }
     }
 
@@ -547,7 +547,7 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
     }
 
     function setLocalArchiveFromFileList(files) {
-        resetCssCache();
+        resetAssetsCache();
         selectedArchive = zimArchiveLoader.loadArchiveFromFiles(files, function (archive) {
             // The archive is set : go back to home page to start searching
             $("#btnHome").click();
@@ -823,7 +823,7 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
     
     // Cache for CSS styles contained in ZIM.
     // It significantly speeds up subsequent page display. See kiwix-js issue #335
-    var cssCache = new Map();
+    var assetsCache = new Map();
 
     /**
      * Display the the given HTML article in the web page,
@@ -833,6 +833,39 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
      * @param {String} htmlArticle
      */
     function displayArticleContentInIframe(dirEntry, htmlArticle) {
+        /**
+         * Declares a per-page object to keep track of the page state
+         * @type Object
+         */
+        var pageState = {
+            'cssCount': null,
+            'cssExtracted': null,
+            'imagesCount': null,
+            'imagesExtracted': null,
+            'scriptsCount': null,
+            'scriptsExtracted': null,
+            'fnQueue': []
+        };
+        // Scroll the iframe to its top
+        $("#articleContent").contents().scrollTop(0);
+
+        // Remove any BOM (causes Quirks Mode in browser)
+        htmlArticle = htmlArticle.replace(/^[^<]*/, '');
+        
+        // Remove and save inline javascript contents only (does not remove scripts with src)
+        // This is required because most app CSPs forbid inline scripts or require hashes
+        // DEV: {5,} in regex means script must have at least 5 characters between the script tags to be matched
+        var regexpScripts = /<script\b(?![^>]+src\s*=)[^>]*>([^<]{5,})<\/script>/ig;
+        var inlineJavaScripts = [];
+        htmlArticle = htmlArticle.replace(regexpScripts, function(match, inlineScript) {
+            inlineJavaScripts.push(inlineScript);
+            return "";
+        });
+        // Find, neutralize and store all inline events for CSP-restricted apps
+        var inlineEventsSheet = uiUtil.replaceInlineEvents(htmlArticle);
+        htmlArticle = inlineEventsSheet[0];
+        inlineEventsSheet = inlineEventsSheet[1];
+
         // Replaces ZIM-style URLs of img, script and link tags with a data-url to prevent 404 errors [kiwix-js #272 #376]
         // This replacement also processes the URL to remove the path so that the URL is ready for subsequent jQuery functions
         htmlArticle = htmlArticle.replace(regexpTagsWithZimUrl, "$1data-kiwixurl$2$3");            
@@ -867,15 +900,55 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
             pushBrowserHistoryState(dirEntry.namespace + "/" + dirEntry.url);
             
             parseAnchorsJQuery();
-            loadImagesJQuery();
             loadCSSJQuery();
-            //JavaScript loading currently disabled
-            //loadJavaScriptJQuery();            
+            loadImagesJQuery();
+            qFns(loadJavaScriptJQuery, 'cssCount', 'cssExtracted');
+            qFns(injectInlineScriptsJQuery, 'scriptsCount', 'scriptsExtracted');
+            parseEvents();
         };
      
         // Load the blank article to clear the iframe (NB iframe onload event runs *after* this)
         iframeArticleContent.src = "article.html";
 
+        function qFns(fn, val1, val2) {
+            var newFunc = {
+                'fn': fn,
+                'val1': val1,
+                'val2': val2
+            };
+            pageState.fnQueue.push(newFunc);
+            queueControl();
+        }
+        
+        function queueControl() {
+            if (!pageState.fnQueue.length) return;
+            if (pageState[pageState.fnQueue[0].val1] === pageState[pageState.fnQueue[0].val2]) {
+                var nextFn = pageState.fnQueue[0].fn;
+                pageState.fnQueue.shift();
+                console.log('Starting function ' + nextFn.name);
+                nextFn();
+                queueControl();
+            } else {
+                setTimeout(queueControl, 500);
+            }
+        }
+        
+        function parseEvents() {
+            if (!inlineEventsSheet) return;
+            var iframe = document.getElementById('articleContent').contentDocument;
+            var selectedNodes = iframe.querySelectorAll('[data-kiwixevents]');
+            if (!selectedNodes) { 
+                console.error('[parseEvents] No data-kiwixevents attribute found!');
+                return;
+            }
+            uiUtil.createScriptBlob(iframe, inlineEventsSheet, null, false, function() {
+                for (var e = selectedNodes.length; e--;) {
+                    var storedEvents = selectedNodes[e].dataset.kiwixevents.match(/[^;]+/g);
+                    uiUtil.attachInlineFunctions("articleContent", selectedNodes[e], storedEvents);
+                }       
+            });
+        }
+        
         function parseAnchorsJQuery() {
             var currentProtocol = location.protocol;
             var currentHost = location.host;
@@ -933,6 +1006,8 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
                 var image = $(this);
                 var imageUrl = image.attr("data-kiwixurl");
                 var title = decodeURIComponent(imageUrl);
+                // Increment pageState image counter to keep track of number of images sent to decompressor
+                pageState.imagesCount++;
                 selectedArchive.getDirEntryByTitle(title).then(function(dirEntry) {
                     selectedArchive.readBinaryFile(dirEntry, function (fileDirEntry, content) {
                         // TODO : use the complete MIME-type of the image (as read from the ZIM file)
@@ -946,8 +1021,10 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
                         mimetype = /\.ico$/i.test(url) ? "image/x-icon" : mimetype;
                         mimetype = /\.svg$/i.test(url) ? "image/svg+xml" : mimetype;
                         uiUtil.feedNodeWithBlob(image, 'src', content, mimetype);
+                        pageState.imagesExtracted++;
                     });
                 }).fail(function (e) {
+                    pageState.imagesCount--;
                     console.error("could not find DirEntry for image:" + title, e);
                 });
             });
@@ -965,17 +1042,16 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
                 collapsedBlocks[i].classList.add('open-block');
             }
 
-            var cssCount = 0;
-            var cssFulfilled = 0;
             $('#articleContent').contents().find('link[data-kiwixurl]').each(function () {
-                cssCount++;
                 var link = $(this);
                 var linkUrl = link.attr("data-kiwixurl");
                 var title = uiUtil.removeUrlParameters(decodeURIComponent(linkUrl));
-                if (cssCache.has(title)) {
-                    var cssContent = cssCache.get(title);
+                // Increment pageState CSS counter to keep track of number of CSS sent to decompressor
+                pageState.cssCount++;
+                if (assetsCache && assetsCache.has(title)) {
+                    var cssContent = assetsCache.get(title);
                     uiUtil.replaceCSSLinkWithInlineCSS(link, cssContent);
-                    cssFulfilled++;
+                    pageState.cssExtracted++;
                 } else {
                     $('#cachingCSS').show();
                     selectedArchive.getDirEntryByTitle(title)
@@ -983,16 +1059,17 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
                         return selectedArchive.readUtf8File(dirEntry,
                             function (fileDirEntry, content) {
                                 var fullUrl = fileDirEntry.namespace + "/" + fileDirEntry.url;
-                                cssCache.set(fullUrl, content);
+                                if (assetsCache) assetsCache.set(fullUrl, content);
                                 uiUtil.replaceCSSLinkWithInlineCSS(link, content);
-                                cssFulfilled++;
+
+                                pageState.cssExtracted++;
                                 renderIfCSSFulfilled(fileDirEntry.url);
                             }
                         );
                     }).fail(function (e) {
                         console.error("could not find DirEntry for CSS : " + title, e);
-                        cssCount--;
-                        renderIfCSSFulfilled();
+                        pageState.cssCount--;
+                        renderIfCSSFulfilled(fileDirEntry.url);
                     });
                 }
             });
@@ -1001,7 +1078,7 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
             // Some pages are extremely heavy to render, so we prevent rendering by keeping the iframe hidden
             // until all CSS content is available [kiwix-js #381]
             function renderIfCSSFulfilled(title) {
-                if (cssFulfilled >= cssCount) {
+                if (pageState.cssExtracted >= pageState.cssCount) {
                     $('#cachingCSS').html('Caching styles...');
                     $('#cachingCSS').hide();
                     $('#searchingArticles').hide();
@@ -1009,7 +1086,7 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
                     // We have to resize here for devices with On Screen Keyboards when loading from the article search list
                     resizeIFrame();
                 } else if (title) {
-                    title = title.replace(/[^/]+\//g, '').substring(0,18);
+                    title = title.replace(/[^/]+\//g, '').substring(0, 18);
                     $('#cachingCSS').html('Caching ' + title + '...');
                 }
             }
@@ -1017,23 +1094,54 @@ define(['jquery', 'zimArchiveLoader', 'util', 'uiUtil', 'cookies','abstractFiles
 
         function loadJavaScriptJQuery() {
             $('#articleContent').contents().find('script[data-kiwixurl]').each(function() {
+                var iframe = document.getElementById('articleContent').contentDocument;
                 var script = $(this);
                 var scriptUrl = script.attr("data-kiwixurl");
                 // TODO check that the type of the script is text/javascript or application/javascript
                 var title = uiUtil.removeUrlParameters(decodeURIComponent(scriptUrl));
-                selectedArchive.getDirEntryByTitle(title).then(function(dirEntry) {
+                pageState.scriptsCount++;
+                if (assetsCache && assetsCache.has(title)) {
+                    scriptUrl = assetsCache.get(title);
+                    var newScript = iframe.createElement('script');
+                    newScript.src = scriptUrl;
+                    newScript.dataset.kiwixsrc = title;
+                    iframe.head.appendChild(newScript);
+                    pageState.scriptsExtracted++;
+                    script.remove();
+                } else {
+                    selectedArchive.getDirEntryByTitle(title).then(function(dirEntry) {
                     if (dirEntry === null) {
                         console.log("Error: js file not found: " + title);
+                        pageState.scriptsCount--;
                     } else {
-                        selectedArchive.readBinaryFile(dirEntry, function (fileDirEntry, content) {
-                            // TODO : JavaScript support not yet functional [kiwix-js #152]
-                            uiUtil.feedNodeWithBlob(script, 'src', content, 'text/javascript');
+                        return selectedArchive.readBinaryFile(dirEntry, function (fileDirEntry, content) {
+                            var fullUrl = fileDirEntry.namespace + "/" + fileDirEntry.url; 
+                            var scriptUrl = uiUtil.createScriptBlob(iframe, content, script[0], true);
+                            if (assetsCache) assetsCache.set(fullUrl, scriptUrl);
+                            pageState.scriptsExtracted++;
+                            script.remove();
                         });
                     }
-                }).fail(function (e) {
-                    console.error("could not find DirEntry for javascript : " + title, e);
-                });
+                    }).fail(function (e) {
+                        console.error("could not find DirEntry for javascript : " + title, e);
+                        pageState.scriptsCount--;
+                    });
+                }
             });
+        }
+
+        function injectInlineScriptsJQuery() {
+            if (!inlineJavaScripts.length) return;
+            var iframe = document.getElementById('articleContent').contentDocument;
+            // Temporarily inject our jQuery until we can extract from archive
+                // var jQuery = iframe.createElement('script');
+                // var treePath = baseUrl.replace(/([^/]+\/)/g, "../");
+                // jQuery.src = treePath + "js/lib/jquery-3.2.1.slim.js";
+                // iframe.body.appendChild(jQuery);
+            // End of temp code
+            for (var i = 0; i < inlineJavaScripts.length; i++) {
+                uiUtil.createScriptBlob(iframe, inlineJavaScripts[i]);
+    }
         }
     }
 
